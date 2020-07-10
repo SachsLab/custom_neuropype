@@ -5,3 +5,4 @@ from .UpdateElectrodePositions import UpdateElectrodePositions
 from .VariantLDA import VariantLDA
 from .AsType import AsType
 from .ReconContFromEvents import ReconContFromEvents
+from .GetNonzeroData import GetNonzeroData

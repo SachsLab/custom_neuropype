@@ -41,8 +41,9 @@ class ReconContFromEvents(Node):
         wf_name, wf_chunk = find_first_chunk(pkt, with_axes=(instance, time),
                                              without_flags=(Flags.is_signal, Flags.is_sparse),
                                              allow_markers=False)
+        wf_blk = wf_chunk.block
 
-        # Get the event train. Only useful for
+        # Get the event train.
         evt_name, evt_chunk = find_first_chunk(pkt, with_axes=(space, time),
                                                with_flags=Flags.is_sparse,
                                                allow_markers=False)
@@ -51,19 +52,22 @@ class ReconContFromEvents(Node):
         sig_name, sig_chunk = find_first_chunk(pkt, with_axes=(space, time),
                                                without_flags=Flags.is_sparse)
 
-        # Make TimeAxis new continuous data
-        wf_blk = wf_chunk.block
-        t0 = 0.0  # np.min(wf_blk.axes['ne.instance'].times) + wf_blk.axes['time'].times[0]
-        t_end = np.max(wf_blk.axes[instance].times) + wf_blk.axes[time].times[-1]
-        step_size = 1 / wf_blk.axes[time].nominal_rate
-        t_vec = np.arange(t0, t_end + step_size, step_size)
-        new_time_ax = TimeAxis(times=t_vec, nominal_rate=wf_blk.axes[time].nominal_rate)
+        # Make time axis for new continuous data
+        if evt_name is not None:
+            new_time_ax = deepcopy_most(evt_chunk.block.axes[time])
+        else:
+            t0 = 0.0  # np.min(wf_blk.axes['ne.instance'].times) + wf_blk.axes['time'].times[0]
+            t_end = np.max(wf_blk.axes[instance].times) + wf_blk.axes[time].times[-1]
+            step_size = 1 / wf_blk.axes[time].nominal_rate
+            t_vec = np.arange(t0, t_end + step_size, step_size)
+            new_time_ax = TimeAxis(times=t_vec, nominal_rate=wf_blk.axes[time].nominal_rate)
 
         # Make SpaceAxis for new continuous data
         # Get channel labels, sort so Ch10 is after Ch9, etc.
         chan_labels = np.unique(wf_blk.axes[instance].data['chan_label'])
         sort_ix = np.argsort([int(_[2:]) for _ in chan_labels])
         chan_labels = chan_labels[sort_ix]
+
         # Get channel positions if available
         if evt_name:
             sp_ax = evt_chunk.block.axes[space]
@@ -72,41 +76,54 @@ class ReconContFromEvents(Node):
             new_pos = None
         new_space_ax = SpaceAxis(names=chan_labels, positions=new_pos)
 
-        # Calculate index offsets for each waveform
+        # Calculate offset sample indices for a single waveform relative to event at t=0
         wf_idx_off = (wf_blk.axes[time].times * wf_blk.axes[time].nominal_rate).astype(int)
 
-        # Initialize null continuous data
-        dat = np.zeros((len(chan_labels), len(t_vec)), dtype=wf_blk.data.dtype)
+        # Initialize output block with zeros
+        out_shape = (len(new_space_ax), len(new_time_ax))
+        if False:
+            import lazy_ops
+            dset = lazy_ops.create_with_tempfile(out_shape, dtype=wf_blk.dtype)
+        else:
+            dset = np.zeros(out_shape, dtype=wf_blk.dtype)
+
+        sig_blk = Block(data=dset, axes=(new_space_ax, new_time_ax))
 
         # Superimpose spikes on zeros, one channel at a time
         for ch_ix, ch_label in enumerate(chan_labels):
-            ch_blk = wf_blk[..., instance[wf_blk.axes[instance].data['chan_label'] == ch_label], ...]
-            if ch_blk.size:
-                ch_wf_dat = np.copy(ch_blk[instance, time].data).flatten()
-                ch_idx = np.searchsorted(t_vec, ch_blk.axes[instance].times)[:, None] + wf_idx_off[None, :]
-                ch_idx = ch_idx.flatten()
+            b_insts = wf_blk.axes[instance].data['chan_label'] == ch_label
+            if np.any(b_insts):
+                # Get all the waveforms for this channel, then concatenate them side-by-side
+                ch_wf_dat = wf_blk[instance, ...].data[b_insts].flatten()
+                # Get the time-indices for all the waveforms, then concatenate them side-by-side
+                ch_wf_idx = (np.searchsorted(new_time_ax.times, wf_blk.axes[instance].times[b_insts])[:, None]
+                             + wf_idx_off[None, :]).flatten()
+                # Drop samps of waveforms that extend beyond data limits
+                ch_wf_idx = ch_wf_idx[ch_wf_idx < len(sig_blk.axes[time])]
+                ch_wf_idx = ch_wf_idx[ch_wf_idx >= 0]
                 # Only take the first occurrence of any particular sample to avoid
                 #  samples that may be over-represented if there are overlapping waveforms.
-                uq_ch_idx, uq_wf_idx = np.unique(ch_idx, return_index=True)
-                dat[ch_ix, uq_ch_idx] = ch_wf_dat[uq_wf_idx]
-
-        raw_blk = Block(data=dat, axes=(new_space_ax, new_time_ax))
+                uq_ch_wf_idx, uq_wf_idx = np.unique(ch_wf_idx, return_index=True)
+                if isinstance(sig_blk._data, np.ndarray):
+                    sig_blk.data[ch_ix, uq_ch_wf_idx] = ch_wf_dat[uq_wf_idx]
+                else:  # lazy_ops DatasetView
+                    sig_blk[space[ch_ix], time].data[:, uq_ch_wf_idx] = ch_wf_dat[uq_wf_idx]
 
         # Add white noise to samples that weren't written with waveforms.
         if self.add_noise:
             # Noise should very rarely cross threshold.
             # Set 4 STDs (=99.96% of samples) to be less than threshold of -54 uV:
             noise_std = 54/4
-            for ch_dat in raw_blk.data:
+            for ch_dat in sig_blk.data:
                 b_zero = ch_dat == 0.
                 ch_dat[b_zero] = (noise_std * np.random.randn(np.sum(b_zero))).astype(np.int16)
 
         # Superimpose interpolated LFPs if available
         if self.add_lfps and sig_name is not None:
-            lfp_blk = sig_chunk.block[space[raw_blk.axes[space].names.tolist()], ..., time]
+            lfp_blk = sig_chunk.block[space[sig_blk.axes[space].names.tolist()], ..., time]
             # Manual interpolation, one channel at a time, to save memory
             from scipy.interpolate import interp1d
-            new_times = raw_blk.axes[time].times
+            new_times = sig_blk.axes[time].times
             old_times = lfp_blk.axes[time].times
             for chan_ix, chan_label in enumerate(lfp_blk.axes[space].names):
                 if chan_label in chan_labels:
@@ -114,9 +131,10 @@ class ReconContFromEvents(Node):
                                  assume_sorted=True, fill_value='extrapolate')
                     lfp_upsamp = f(new_times)
                     full_ch_ix = np.where(chan_labels == chan_label)[0][0]
-                    raw_blk.data[full_ch_ix] = raw_blk.data[full_ch_ix] + lfp_upsamp.astype(raw_blk.data.dtype)
+                    sig_blk.data[full_ch_ix] = sig_blk.data[full_ch_ix] + lfp_upsamp.astype(sig_blk.data.dtype)
 
-        self._data = Packet(chunks={'recon_raw': raw_blk})
+        self._data = Packet(chunks={'recon_raw': Chunk(block=sig_blk,
+                                                       props={Flags.is_streaming: False, Flags.is_signal: True})})
 
     def on_port_assigned(self):
         """Callback to reset internal state when a value was assigned to a

@@ -2,9 +2,6 @@ import logging
 import numpy as np
 from neuropype.engine import *
 from neuropype.utilities import cache
-import tempfile
-import h5pickle as h5py
-import weakref
 import lazy_ops
 
 
@@ -15,7 +12,7 @@ class AsType(Node):
     """Change data type."""
 
     # --- Input/output ports ---
-    data = DataPort(Packet, "Data to process.")
+    data = DataPort(Packet, "Data to process.", mutating=False)
 
     # --- Properties ---
     dtype = EnumPort('none', domain=['float64', 'float32', 'float16', 'int64', 'int32', 'int16', 'int8', 'none'],
@@ -41,16 +38,19 @@ class AsType(Node):
                            version='0.1.0', status=DevStatus.alpha)
 
     @data.setter
-    def data(self, v):
+    def data(self, pkt):
         # try to read from cache
         record = cache.try_lookup(context=self, enabled=self.use_caching,
-                                  verbose=True, data=v, state=None)
+                                  verbose=True, data=pkt, state=None)
 
         if record.success():
             self._data = record.data
             return
 
-        for n, chunk in enumerate_chunks(v, nonempty=True):
+        out_chunks = {}
+        for n, chunk in enumerate_chunks(pkt, nonempty=True):
+
+            out_axes = deepcopy_most(chunk.block.axes)
 
             dtype = {'float64': np.float64, 'float32': np.float32, 'float16': np.float16,
                      'int64': np.int64, 'int32': np.int32, 'int16': np.int16, 'int8': np.int8,
@@ -58,26 +58,25 @@ class AsType(Node):
 
             if self.data_class == 'DatasetView' or\
                     (isinstance(chunk.block._data, lazy_ops.DatasetView) and self.data_class == 'none'):
-                # Create a tempfile and close it.
-                tf = tempfile.NamedTemporaryFile(delete=False)
-                tf.close()
-                # Open again with h5py/h5pickle
-                f = h5py.File(tf.name, mode='w', libver='latest')
-                dset_name_in_parent = chunk.block._data._dataset.name.split('/')[-1]
-                chunk.block._data._dataset = f.create_dataset(dset_name_in_parent,
-                                                              data=chunk.block._data, dtype=dtype,
-                                                              chunks=True, compression="gzip")
-                f.swmr_mode = True
-                # Setup an automatic deleter for the new tempfile
-                chunk.block._data._finalizer = weakref.finalize(
-                    chunk.block._data, chunk.block._data.on_finalize, f, f.filename)
+                # Create new DatasetView backed by tempfile
+                cache_settings = chunk.block._data._dataset.file.id.get_access_plist().get_cache()
+                file_kwargs = {'rdcc_nbytes': cache_settings[2],
+                               'rdcc_nslots': cache_settings[1]}
+                data = lazy_ops.create_with_tempfile(chunk.block.shape, dtype=dtype,
+                                                     chunks=chunk.block._data._dataset.chunks,
+                                                     **file_kwargs)
+                data[:] = chunk.block._data
 
             elif self.data_class == 'ndarray' or\
                     (isinstance(chunk.block._data, np.ndarray) and self.data_class == 'none'):
-                chunk.block._data = np.array(chunk.block._data).astype(dtype)
+                data = np.array(chunk.block._data).astype(dtype)
 
-        record.writeback(data=v)
-        self._data = v
+            out_chunks[n] = Chunk(block=Block(data=data, axes=out_axes),
+                                  props=deepcopy_most(chunk.props))
+
+        pkt = Packet(chunks=out_chunks)
+        record.writeback(data=pkt)
+        self._data = pkt
 
     def on_port_assigned(self):
         """Callback to reset internal state when a value was assigned to a
