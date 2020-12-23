@@ -2,7 +2,6 @@ import logging
 import numpy as np
 from neuropype.engine import *
 from neuropype.utilities import cache
-import lazy_ops
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +38,8 @@ class AsType(Node):
 
     @data.setter
     def data(self, pkt):
+        import lazy_ops
+
         # try to read from cache
         record = cache.try_lookup(context=self, enabled=self.use_caching,
                                   verbose=True, data=pkt, state=None)
